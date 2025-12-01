@@ -209,5 +209,6 @@ __marimo__/
 # Input and Output directories
 input/*
 !input/.gitkeep
+!input/input.geojson
 output/*
 !output/.gitkeep
