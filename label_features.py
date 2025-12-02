@@ -38,7 +38,10 @@ def setup_gee():
     try:
         if GEE_SERVICE_ACCOUNT_KEY_FILE and os.path.exists(GEE_SERVICE_ACCOUNT_KEY_FILE):
             print(f"Authenticating with Service Account: {GEE_SERVICE_ACCOUNT_KEY_FILE}")
-            credentials = service_account.Credentials.from_service_account_file(GEE_SERVICE_ACCOUNT_KEY_FILE)
+            credentials = service_account.Credentials.from_service_account_file(
+                GEE_SERVICE_ACCOUNT_KEY_FILE,
+                scopes=['https://www.googleapis.com/auth/earthengine']
+            )
             ee.Initialize(credentials=credentials)
         else:
             print("Authenticating with default credentials (earthengine authenticate)...")
