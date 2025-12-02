@@ -223,15 +223,48 @@ def get_feature_coordinates(client, img, feature_name):
         print(f"Error communicating with Gemini: {e}")
         return None
 
+def initialize_output_file():
+    """Creates or overwrites the output file with an empty FeatureCollection."""
+    empty_collection = {
+        "type": "FeatureCollection",
+        "features": []
+    }
+    with open(OUTPUT_GEOJSON, 'w') as f:
+        json.dump(empty_collection, f, indent=2)
+
+def append_features_to_output(new_features):
+    """Appends a list of features to the existing GeoJSON file."""
+    if not new_features:
+        return
+
+    try:
+        with open(OUTPUT_GEOJSON, 'r+') as f:
+            data = json.load(f)
+            data['features'].extend(new_features)
+            f.seek(0)
+            json.dump(data, f, indent=2)
+            f.truncate()
+    except FileNotFoundError:
+        # Should not happen if initialized, but handle gracefully
+        with open(OUTPUT_GEOJSON, 'w') as f:
+            collection = {
+                "type": "FeatureCollection",
+                "features": new_features
+            }
+            json.dump(collection, f, indent=2)
+
 def process_feature(client, feature):
-    """Processes a single GeoJSON feature against all available GEE images."""
+    """
+    Processes a single GeoJSON feature against all available GEE images.
+    Yields a list of detected features for each processed image.
+    """
     props = feature.get("properties", {})
     geom = feature.get("geometry", {})
     feature_id = props.get("id", "unknown")
     
     if geom.get("type") != "Polygon":
         print(f"Skipping non-polygon feature: {feature_id}")
-        return []
+        return
 
     # Get coordinates for GEE
     coords = geom["coordinates"] # GEE expects [[[lon, lat], ...]] for Polygon
@@ -241,9 +274,7 @@ def process_feature(client, feature):
     
     if not images_and_metadata:
         print(f"No images found for feature {feature_id}")
-        return []
-
-    all_detections_for_feature = []
+        return
 
     for img, metadata in images_and_metadata:
         # Detect features
@@ -253,28 +284,16 @@ def process_feature(client, feature):
 
         width, height = img.size
         
-        # For mapping back to lat/lng, we need the bounds of the image we requested.
-        # In get_gee_images, we requested the bounds of the ROI + buffer.
-        # We can re-calculate the bounds here or pass them back.
-        # For simplicity, let's assume the image corresponds exactly to the requested region.
-        # But wait, getThumbURL might fit the region into the dimensions.
-        # A more robust way is to ask GEE for the bounds of the resulting image, but that's complex.
-        # Approximation: We know the ROI.
-        
-        # Let's recalculate the bounds used in get_gee_images
+        # Recalculate bounds (same logic as before)
         roi = ee.Geometry.Polygon(coords)
         buffered_roi = roi.buffer(REGION_BUFFER).bounds().getInfo()
-        roi_coords = buffered_roi['coordinates'][0] # List of [lon, lat]
-        
-        # Find min/max lon/lat
+        roi_coords = buffered_roi['coordinates'][0]
         lons = [c[0] for c in roi_coords]
         lats = [c[1] for c in roi_coords]
         min_lon, max_lon = min(lons), max(lons)
         min_lat, max_lat = min(lats), max(lats)
         
-        # Image covers [min_lon, min_lat] to [max_lon, max_lat]
-        # width corresponds to (max_lon - min_lon)
-        # height corresponds to (max_lat - min_lat)
+        current_image_features = []
         
         for d in detections:
             # Normalized 0-1000
@@ -284,12 +303,6 @@ def process_feature(client, feature):
             norm_y2 = d['y2'] / 1000
             
             # Map to Lat/Lng
-            # x is longitude (left to right)
-            # y is latitude (top to bottom? No, map coordinates: y increases upwards (North))
-            # BUT, in images, y=0 is top. So y increases downwards.
-            # Latitude: min_lat is bottom, max_lat is top.
-            # So y=0 (top) -> max_lat. y=1 (bottom) -> min_lat.
-            
             lon1 = min_lon + norm_x1 * (max_lon - min_lon)
             lat1 = max_lat - norm_y1 * (max_lat - min_lat)
             lon2 = min_lon + norm_x2 * (max_lon - min_lon)
@@ -310,9 +323,10 @@ def process_feature(client, feature):
                     "source_metadata": metadata
                 }
             }
-            all_detections_for_feature.append(out_feature)
-            
-    return all_detections_for_feature
+            current_image_features.append(out_feature)
+        
+        if current_image_features:
+            yield current_image_features
 
 def main():
     if not setup_gee():
@@ -332,25 +346,23 @@ def main():
         print(f"Error: {INPUT_GEOJSON} not found.")
         return
 
-    all_output_features = []
+    # Initialize output file
+    initialize_output_file()
     
     features = input_data.get("features", [])
     print(f"Processing {len(features)} input features...")
     
-    for feature in features:
-        detected_features = process_feature(client, feature)
-        all_output_features.extend(detected_features)
-        # time.sleep(1) # Rate limiting not strictly needed for GEE/Gemini in this loop structure but good practice
-
-    output_collection = {
-        "type": "FeatureCollection",
-        "features": all_output_features
-    }
-
-    with open(OUTPUT_GEOJSON, 'w') as f:
-        json.dump(output_collection, f, indent=2)
+    total_detected = 0
     
-    print(f"Saved {len(all_output_features)} detected features to {OUTPUT_GEOJSON}")
+    for feature in features:
+        # Iterate through the generator which yields results per image
+        for batch_of_features in process_feature(client, feature):
+            append_features_to_output(batch_of_features)
+            count = len(batch_of_features)
+            total_detected += count
+            print(f"  Saved {count} detected features to {OUTPUT_GEOJSON}")
+    
+    print(f"Processing complete. Total detected features: {total_detected}")
 
 if __name__ == "__main__":
     main()
