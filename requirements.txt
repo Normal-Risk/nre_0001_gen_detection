@@ -2,3 +2,5 @@ google-genai
 Pillow
 python-dotenv
 requests
+earthengine-api
+google-auth

@@ -137,6 +137,7 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+service-account-key.json
 .venv
 env/
 venv/
