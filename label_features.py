@@ -171,11 +171,12 @@ def get_feature_coordinates(client, img, feature_name):
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash-lite',
             contents=[prompt, img]
         )
         
-        # print(f"Token usage: {response.usage_metadata}")
+        usage = response.usage_metadata
+        print(f"    Token stats: Input={usage.prompt_token_count}, Output={usage.candidates_token_count}, Total={usage.total_token_count}")
         
         text = response.text
         
