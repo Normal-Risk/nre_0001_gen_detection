@@ -171,7 +171,7 @@ def get_feature_coordinates(client, img, feature_name):
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash-lite',
+            model='gemini-3-pro-preview',
             contents=[prompt, img]
         )
         
