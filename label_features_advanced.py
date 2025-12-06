@@ -10,6 +10,7 @@ from google import genai
 from google.oauth2 import service_account
 from dotenv import load_dotenv
 import ee
+import concurrent.futures
 
 # Load environment variables
 load_dotenv()
@@ -17,8 +18,8 @@ load_dotenv()
 # --- CONFIGURATION ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEE_SERVICE_ACCOUNT_KEY_FILE = os.getenv("GEE_SERVICE_ACCOUNT_KEY_FILE")
-INPUT_GEOJSON = "input/input.geojson"
-OUTPUT_GEOJSON = "output/output.geojson"
+INPUT_GEOJSON = "input/test_input.geojson"
+OUTPUT_GEOJSON = "output/output_original_test.geojson"
 FEATURE_PROMPT = "irrigation pivot"
 # GEE Parameters
 GEE_COLLECTION = "USDA/NAIP/DOQQ"
@@ -57,83 +58,49 @@ def setup_gee():
             print("Please run 'earthengine authenticate' in your terminal if you haven't already.")
         return False
 
-def get_gee_images(geometry_coords, feature_id):
+def get_gee_metadata(geometry_coords, feature_id):
     """
-    Fetches all available images for a given geometry from the NAIP collection.
-    Returns a list of tuples: (PIL.Image, metadata_dict)
+    Fetches metadata for all available images for a given geometry from the NAIP collection.
+    Returns a list of metadata dictionaries.
     """
     try:
-        # Create an ee.Geometry from the input coordinates
-        # GeoJSON coordinates are [lon, lat], which GEE expects
         roi = ee.Geometry.Polygon(geometry_coords)
-        
-        # Buffer the region slightly to ensure we get the whole feature plus context
-        # NAIP images are tiles, so we might need to mosaic if the feature crosses tiles.
-        # However, for simplicity, we'll filter by bounds and mosaic the overlapping images for each distinct date.
-        # Actually, NAIP is a collection of images. We want to see the feature at different times.
-        # So we should group by date.
         
         collection = ee.ImageCollection(GEE_COLLECTION)\
             .filterBounds(roi)\
-            .sort('system:time_start', False) # Newest first
+            .sort('system:time_start', False)
 
-        # Get the list of images (client-side)
-        # Limit to a reasonable number to avoid timeouts if there are tons
-        image_list = collection.toList(50) 
-        count = image_list.size().getInfo()
+        # Fetch metadata for up to 50 images in one call
+        images_info = collection.limit(50).getInfo()
         
+        if 'features' not in images_info:
+            print(f"No images found for feature {feature_id}")
+            return []
+            
+        count = len(images_info['features'])
         print(f"Found {count} images for feature {feature_id}")
         
         results = []
-        
-        # Iterate through the images
-        for i in range(count):
-            ee_img = ee.Image(image_list.get(i))
-            info = ee_img.getInfo()
-            props = info.get('properties', {})
-            img_id = info.get('id')
+        for img_info in images_info['features']:
+            img_id = img_info['id']
+            props = img_info.get('properties', {})
             timestamp = props.get('system:time_start')
             
-            # Convert timestamp to readable date
             date_str = "Unknown"
             if timestamp:
                 dt = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
                 date_str = dt.isoformat()
-            
-            print(f"  Processing image {i+1}/{count}: {img_id} ({date_str})")
-            
-            # Select RGB bands (NAIP has R, G, B, N)
-            vis_params = {
-                'min': 0,
-                'max': 255,
-                'bands': ['R', 'G', 'B'],
-                'dimensions': 1024, # Max dimension
-                'region': roi.buffer(REGION_BUFFER).bounds().getInfo()['coordinates'] # Use buffered bounds
-            }
-            
-            try:
-                url = ee_img.getThumbURL(vis_params)
-                response = requests.get(url)
-                if response.status_code == 200:
-                    img_data = Image.open(BytesIO(response.content))
-                    
-                    metadata = {
-                        "gee_id": img_id,
-                        "date": date_str,
-                        "timestamp": timestamp,
-                        "collection": GEE_COLLECTION,
-                        "scale": SCALE
-                    }
-                    results.append((img_data, metadata))
-                else:
-                    print(f"    Failed to download thumbnail: {response.status_code}")
-            except Exception as e:
-                print(f"    Error generating thumbnail: {e}")
                 
+            results.append({
+                "id": img_id,
+                "date": date_str,
+                "timestamp": timestamp
+            })
+            
         return results
 
     except Exception as e:
-        print(f"Error fetching GEE images: {e}")
+        print(f"Error fetching GEE metadata: {e}")
         return []
 
 def get_feature_coordinates(client, img, feature_name):
@@ -254,9 +221,82 @@ def append_features_to_output(new_features):
             }
             json.dump(collection, f, indent=2)
 
+def process_single_image(client, meta, region_coords, bounds_info):
+    """
+    Downloads and processes a single image.
+    """
+    try:
+        img_id = meta['id']
+        # print(f"  Processing image: {img_id} ({meta['date']})") 
+        
+        ee_img = ee.Image(img_id)
+        
+        vis_params = {
+            'min': 0,
+            'max': 255,
+            'bands': ['R', 'G', 'B'],
+            'dimensions': 1024,
+            'region': region_coords
+        }
+        
+        url = ee_img.getThumbURL(vis_params)
+        response = requests.get(url)
+        
+        if response.status_code != 200:
+            print(f"    Failed to download thumbnail {img_id}: {response.status_code}")
+            return []
+            
+        img_data = Image.open(BytesIO(response.content))
+        
+        detections = get_feature_coordinates(client, img_data, FEATURE_PROMPT)
+        if not detections:
+            return []
+            
+        min_lon, max_lon, min_lat, max_lat = bounds_info
+        
+        current_image_features = []
+        for d in detections:
+            norm_x1 = d['x1'] / 1000
+            norm_y1 = d['y1'] / 1000
+            norm_x2 = d['x2'] / 1000
+            norm_y2 = d['y2'] / 1000
+            
+            lon1 = min_lon + norm_x1 * (max_lon - min_lon)
+            lat1 = max_lat - norm_y1 * (max_lat - min_lat)
+            lon2 = min_lon + norm_x2 * (max_lon - min_lon)
+            lat2 = max_lat - norm_y2 * (max_lat - min_lat)
+            
+            out_feature = {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[lon1, lat1], [lon2, lat2]]
+                },
+                "properties": {
+                    "input_feature_id": meta.get('feature_id', 'unknown'),
+                    "confidence": d['confidence'],
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                    "imagery_source": "Google Earth Engine (USDA/NAIP/DOQQ)",
+                    "source_metadata": {
+                        "gee_id": img_id,
+                        "date": meta['date'],
+                        "timestamp": meta['timestamp'],
+                        "collection": GEE_COLLECTION,
+                        "scale": SCALE
+                    }
+                }
+            }
+            current_image_features.append(out_feature)
+            
+        return current_image_features
+        
+    except Exception as e:
+        print(f"    Error processing image {meta.get('id')}: {e}")
+        return []
+
 def process_feature(client, feature):
     """
-    Processes a single GeoJSON feature against all available GEE images.
+    Processes a single GeoJSON feature against all available GEE images in parallel.
     Yields a list of detected features for each processed image.
     """
     props = feature.get("properties", {})
@@ -268,66 +308,49 @@ def process_feature(client, feature):
         return
 
     # Get coordinates for GEE
-    coords = geom["coordinates"] # GEE expects [[[lon, lat], ...]] for Polygon
+    coords = geom["coordinates"] 
 
-    # Fetch images from GEE
-    images_and_metadata = get_gee_images(coords, feature_id)
-    
-    if not images_and_metadata:
-        print(f"No images found for feature {feature_id}")
-        return
-
-    for img, metadata in images_and_metadata:
-        # Detect features
-        detections = get_feature_coordinates(client, img, FEATURE_PROMPT)
-        if not detections:
-            continue
-
-        width, height = img.size
-        
-        # Recalculate bounds (same logic as before)
+    # Pre-calculate bounds and region to avoid repeated GEE calls
+    try:
         roi = ee.Geometry.Polygon(coords)
-        buffered_roi = roi.buffer(REGION_BUFFER).bounds().getInfo()
-        roi_coords = buffered_roi['coordinates'][0]
-        lons = [c[0] for c in roi_coords]
-        lats = [c[1] for c in roi_coords]
+        buffered_roi_info = roi.buffer(REGION_BUFFER).bounds().getInfo()
+        region_coords = buffered_roi_info['coordinates']
+        
+        roi_coords_list = region_coords[0]
+        lons = [c[0] for c in roi_coords_list]
+        lats = [c[1] for c in roi_coords_list]
         min_lon, max_lon = min(lons), max(lons)
         min_lat, max_lat = min(lats), max(lats)
+        bounds_info = (min_lon, max_lon, min_lat, max_lat)
         
-        current_image_features = []
+    except Exception as e:
+        print(f"Error calculating geometry bounds for {feature_id}: {e}")
+        return
+
+    # Fetch metadata
+    images_metadata = get_gee_metadata(coords, feature_id)
+    
+    if not images_metadata:
+        return
         
-        for d in detections:
-            # Normalized 0-1000
-            norm_x1 = d['x1'] / 1000
-            norm_y1 = d['y1'] / 1000
-            norm_x2 = d['x2'] / 1000
-            norm_y2 = d['y2'] / 1000
-            
-            # Map to Lat/Lng
-            lon1 = min_lon + norm_x1 * (max_lon - min_lon)
-            lat1 = max_lat - norm_y1 * (max_lat - min_lat)
-            lon2 = min_lon + norm_x2 * (max_lon - min_lon)
-            lat2 = max_lat - norm_y2 * (max_lat - min_lat)
-            
-            # Create GeoJSON feature
-            out_feature = {
-                "type": "Feature",
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": [[lon1, lat1], [lon2, lat2]]
-                },
-                "properties": {
-                    "input_feature_id": feature_id,
-                    "confidence": d['confidence'],
-                    "processed_at": datetime.now(timezone.utc).isoformat(),
-                    "imagery_source": "Google Earth Engine (USDA/NAIP/DOQQ)",
-                    "source_metadata": metadata
-                }
-            }
-            current_image_features.append(out_feature)
+    # Add feature_id to metadata
+    for meta in images_metadata:
+        meta['feature_id'] = feature_id
+
+    # Process in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_meta = {
+            executor.submit(process_single_image, client, meta, region_coords, bounds_info): meta 
+            for meta in images_metadata
+        }
         
-        if current_image_features:
-            yield current_image_features
+        for future in concurrent.futures.as_completed(future_to_meta):
+            try:
+                result = future.result()
+                if result:
+                    yield result
+            except Exception as e:
+                print(f"Error in worker thread: {e}")
 
 def main():
     if not setup_gee():
