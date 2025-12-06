@@ -10,6 +10,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 import concurrent.futures
 import math
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -73,7 +74,7 @@ def get_centerpoints(client, img, feature_id="unknown"):
         "Your task is to identify **ALL** Center Pivot Irrigation systems visible in this image.\n\n"
         "**Analysis Goals:**\n"
         "For EACH pivot system found, determine:\n"
-        "1.  **Centerpoint**: The precise pixel coordinates (x, y) of the central pivot structure.\n"
+        "1.  **Centerpoint**: The precise pixel coordinates (x, y) of the **physical pivot structure**. Look for the central concrete pad, tower, or hardware hub. **Do NOT** simply estimate the geometric center of the crop circle; you must locate the actual mechanism on the ground.\n"
         "2.  **Pivot Arm**: If a pivot arm is visible, identify its tip coordinates (x, y). If not visible, set to null.\n"
         "3.  **Field Coverage**: Estimate the start and end angles of the irrigated sector (0-360 degrees, 0=North, 90=East). "
         "    *   Full circle = [0, 360].\n"
@@ -261,8 +262,65 @@ def process_single_image(client, meta, region_coords, bounds_info):
         print(f"Error processing image {meta.get('id')}: {e}")
         return [], None
 
+        return [], None
+    
+def process_feature(feature, i, client, file_lock):
+    """Processes a single feature and writes results to file safely."""
+    feature_id = feature.get('id', f'feature_{i}')
+    geom = feature['geometry']
+    if geom['type'] != 'Polygon': return
+    
+    coords = geom['coordinates'] # GEE expects list of rings
+    
+    # Calculate bounds and buffered region
+    try:
+        roi = ee.Geometry.Polygon(coords)
+        buffered_roi_info = roi.buffer(REGION_BUFFER).bounds().getInfo()
+        region_coords = buffered_roi_info['coordinates']
+        
+        # Calculate bounds for pixel conversion (using buffered region)
+        roi_coords_list = region_coords[0]
+        lons = [c[0] for c in roi_coords_list]
+        lats = [c[1] for c in roi_coords_list]
+        bounds_info = (min(lons), max(lons), min(lats), max(lats))
+        
+    except Exception as e:
+        print(f"Error calculating geometry for {feature_id}: {e}")
+        return
+    
+    # Get Metadata
+    metadata_list = get_gee_metadata(coords[0], feature_id) 
+    
+    # Only process the most recent image
+    if metadata_list:
+        metadata_list = metadata_list[:1] 
+    
+    if not metadata_list:
+        print(f"  No images found for {feature_id}")
+        return
+
+    # Process Image (No need for thread pool here if we parallelize features)
+    for meta in metadata_list:
+        result, usage = process_single_image(client, meta, region_coords, bounds_info)
+        if result:
+            print(f"  Found {len(result)} centerpoints for {feature_id}")
+            
+            # Real-time Output Update (Thread-safe)
+            with file_lock:
+                try:
+                    with open(OUTPUT_GEOJSON, 'r+') as f:
+                        data = json.load(f)
+                        data['features'].extend(result)
+                        f.seek(0)
+                        json.dump(data, f, indent=2)
+                        f.truncate()
+                except Exception as e:
+                    print(f"Error updating output file: {e}")
+    return
+
 def main():
     client = initialize_services()
+    file_lock = threading.Lock()
     
     # Load Input
     try:
@@ -272,74 +330,23 @@ def main():
         print(f"Error: Input file {INPUT_GEOJSON} not found.")
         return
     
-    all_features = []
-    
     print(f"Processing {len(input_data['features'])} features from {INPUT_GEOJSON}...")
     
     # Initialize Output File
     with open(OUTPUT_GEOJSON, 'w') as f:
         json.dump({"type": "FeatureCollection", "features": []}, f, indent=2)
 
-    for i, feature in enumerate(input_data['features']):
-        feature_id = feature.get('id', f'feature_{i}')
-        geom = feature['geometry']
-        if geom['type'] != 'Polygon': continue
+    # Parallel Processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(process_feature, feature, i, client, file_lock)
+            for i, feature in enumerate(input_data['features'])
+        ]
         
-        coords = geom['coordinates'] # GEE expects list of rings
-        
-        # Calculate bounds and buffered region
-        try:
-            roi = ee.Geometry.Polygon(coords)
-            buffered_roi_info = roi.buffer(REGION_BUFFER).bounds().getInfo()
-            region_coords = buffered_roi_info['coordinates']
-            
-            # Calculate bounds for pixel conversion (using buffered region)
-            roi_coords_list = region_coords[0]
-            lons = [c[0] for c in roi_coords_list]
-            lats = [c[1] for c in roi_coords_list]
-            bounds_info = (min(lons), max(lons), min(lats), max(lats))
-            
-        except Exception as e:
-            print(f"Error calculating geometry for {feature_id}: {e}")
-            continue
-        
-        # Get Metadata (pass original coords for filtering, or buffered? usually original)
-        # label_features_optimized uses original coords for get_gee_metadata
-        metadata_list = get_gee_metadata(coords[0], feature_id) 
-        
-        # Only process the most recent image
-        if metadata_list:
-            metadata_list = metadata_list[:1] 
-        
-        if not metadata_list:
-            print(f"  No images found for {feature_id}")
-            continue
+        # Wait for all to complete
+        concurrent.futures.wait(futures)
 
-        # Process Images
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [
-                executor.submit(process_single_image, client, meta, region_coords, bounds_info)
-                for meta in metadata_list
-            ]
-            
-            for future in concurrent.futures.as_completed(futures):
-                result, usage = future.result()
-                if result:
-                    all_features.extend(result)
-                    print(f"  Found {len(result)} centerpoints for {feature_id}")
-                    
-                    # Real-time Output Update
-                    try:
-                        with open(OUTPUT_GEOJSON, 'r+') as f:
-                            data = json.load(f)
-                            data['features'].extend(result)
-                            f.seek(0)
-                            json.dump(data, f, indent=2)
-                            f.truncate()
-                    except Exception as e:
-                        print(f"Error updating output file: {e}")
-
-    print(f"Saved {len(all_features)} centerpoints to {OUTPUT_GEOJSON}")
+    print(f"Processing complete. Results saved to {OUTPUT_GEOJSON}")
 
 if __name__ == "__main__":
     main()
