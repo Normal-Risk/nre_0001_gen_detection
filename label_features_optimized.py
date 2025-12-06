@@ -19,13 +19,13 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEE_SERVICE_ACCOUNT_KEY_FILE = os.getenv("GEE_SERVICE_ACCOUNT_KEY_FILE")
 INPUT_GEOJSON = "input/input.geojson"
-OUTPUT_GEOJSON = "output/output_optimized_test.geojson"
+OUTPUT_GEOJSON = "output/output_optimized.geojson"
 FEATURE_PROMPT = "irrigation pivot"
 # GEE Parameters
 GEE_COLLECTION = "USDA/NAIP/DOQQ"
 SCALE = 1.0 # Meters per pixel (NAIP is typically 0.6m or 1m)
 REGION_BUFFER = 100 # Meters to buffer around the polygon for context
-MAX_IMAGES_PER_FEATURE = 5 # Limit to 5 images per feature for cost savings
+
 
 # ---------------------
 
@@ -169,7 +169,7 @@ def get_gee_metadata(geometry_coords, feature_id, start_date='2020-01-01', end_d
             .sort('system:time_start', False)
             
         # Limit to MAX_IMAGES_PER_FEATURE to save costs
-        images_info = collection.limit(MAX_IMAGES_PER_FEATURE).getInfo()
+        images_info = collection.getInfo()
         
         metadata_list = []
         if 'features' in images_info:
