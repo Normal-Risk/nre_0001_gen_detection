@@ -370,7 +370,7 @@ def main():
     # Create Batch Job
     print("Submitting batch job...")
     job = client.batches.create(
-        model="gemini-3-pro-preview", # Using 1.5 Pro 002 for batch support
+        model="gemini-3-pro-preview", # Using 3 Pro Preview as it works with standard API
         src=batch_file.name,
         config=types.CreateBatchJobConfig(
             display_name="pivot_detection_batch"
@@ -395,7 +395,7 @@ def main():
 
     # Download Results
     print("Job succeeded! Downloading results...")
-    output_file_name = job.output_file.name
+    output_file_name = job.dest.file_name
     content = client.files.content(name=output_file_name)
     
     # Process Results
