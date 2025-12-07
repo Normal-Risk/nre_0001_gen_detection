@@ -214,3 +214,5 @@ input/*
 output/*
 !output/.gitkeep
 *.geojson
+*.jsonl
+batch_input.jsonl
