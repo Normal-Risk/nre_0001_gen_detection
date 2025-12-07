@@ -218,15 +218,18 @@ def prepare_batch_request(feature, i, client):
     }
     return request_entry
 
-def process_batch_result(response_text, context):
+def process_batch_result(response_text, context, usage_metadata=None):
     """Processes the model output using the saved context."""
     try:
         # Clean markdown
         text = response_text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.endswith("```"):
-            text = text[:-3]
+        
+        # Try to find JSON block
+        start = text.find('[')
+        end = text.rfind(']')
+        
+        if start != -1 and end != -1:
+            text = text[start:end+1]
         
         data = json.loads(text)
         if not isinstance(data, list) or not data:
@@ -290,7 +293,8 @@ def process_batch_result(response_text, context):
                 "arms": arms_data,
                 "processing_date": datetime.now(timezone.utc).isoformat(),
                 "imagery_source": "Google Earth Engine (USDA/NAIP/DOQQ)",
-                "source_metadata": valid_metas
+                "source_metadata": valid_metas,
+                "token_usage": usage_metadata
             }
         }
         return [feature]
@@ -396,7 +400,7 @@ def main():
     # Download Results
     print("Job succeeded! Downloading results...")
     output_file_name = job.dest.file_name
-    content = client.files.content(name=output_file_name)
+    content = client.files.download(file=output_file_name)
     
     # Process Results
     results_jsonl = content.decode('utf-8')
@@ -405,20 +409,12 @@ def main():
     for line in results_jsonl.splitlines():
         if not line.strip(): continue
         res = json.loads(line)
-        key = res['custom_id'] # The API returns 'custom_id' matching our 'key'
+        key = res['key'] 
         
-        # Extract the response text
-        # The structure depends on the API version, but typically:
-        # response -> candidates -> content -> parts -> text
         try:
-            response_obj = res['response']['body']
-            # It might be a nested JSON string or object depending on SDK
-            if isinstance(response_obj, str):
-                response_obj = json.loads(response_obj)
-                
-            # Navigate to text
-            # This path might need adjustment based on exact API response structure
-            # But let's assume standard GenerateContentResponse structure
+            # Structure: {"key": "...", "response": {"candidates": [...]}}
+            response_obj = res.get('response', {})
+            
             candidates = response_obj.get('candidates', [])
             if candidates:
                 parts = candidates[0].get('content', {}).get('parts', [])
@@ -426,7 +422,8 @@ def main():
                     text_response = parts[0].get('text', '')
                     
                     if key in context_map:
-                        features = process_batch_result(text_response, context_map[key])
+                        usage_metadata = res.get('usageMetadata', {})
+                        features = process_batch_result(text_response, context_map[key], usage_metadata)
                         final_features.extend(features)
                         print(f"  Processed result for {key}")
         except Exception as e:
