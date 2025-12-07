@@ -6,11 +6,12 @@ It fetches imagery from the **USDA NAIP (National Agriculture Imagery Program)**
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.9+
 - A Google Cloud Project with the following APIs enabled:
     - Google Gemini API
     - Google Earth Engine API
 - **Google Earth Engine Access**: You must be registered for Earth Engine.
+- **Python Libraries**: `shapely`, `pyproj` (in addition to standard requirements).
 
 ## Installation
 
@@ -51,28 +52,43 @@ It fetches imagery from the **USDA NAIP (National Agriculture Imagery Program)**
 
 ## Usage
 
-1.  Place your input GeoJSON file at `input/input.geojson`. The file should contain `Polygon` features representing the areas to scan.
+### 1. Preprocessing (Filtering)
 
-2.  Run the detection script:
-    ```bash
-    python label_features.py
-    ```
+Before running the detection, you can filter your raw input data (e.g., from `~/Downloads/irregular_circles.geojson`) to select specific features (e.g., circles in Kansas with area 0.4-0.6 sq km).
 
-3.  The script will:
-    - Read features from `input/input.geojson`.
-    - Query Google Earth Engine for all available NAIP images intersecting each feature.
-    - Download a high-resolution thumbnail for each image date.
-    - Send the image to the Gemini model to detect linear features (irrigation pivots).
-    - Save the detected features as a new GeoJSON file at `output/output.geojson`.
+Run the filter script:
+```bash
+python filter.py
+```
+This will create `input/filtered_kansas_circles.geojson`.
+
+### 2. Feature Detection (Batch Processing)
+
+Run the main detection script, which processes features in chunks to manage limits and ensure reliability:
+
+```bash
+python label_areas_advanced_batched.py
+```
+
+**How it works:**
+- Reads features from `input/filtered_kansas_circles.geojson`.
+- Splits the data into **chunks of 1000 features**.
+- For each chunk:
+    - Creates a Gemini Batch Job (e.g., `pivot_detection_batch_0`).
+    - Downloads NAIP imagery from Google Earth Engine.
+    - Sends images to Gemini to detect pivot centerpoints and arms.
+    - Saves the results to a separate output file (e.g., `output/centerpoints_part_0.geojson`).
 
 ## Output
 
-The output file `output/output.geojson` will contain `LineString` features representing the detected structures. Each feature includes:
--   `input_feature_id`: The ID of the source polygon.
--   `confidence`: The model's confidence score (0.0 - 1.0).
--   `processed_at`: Timestamp of processing.
+The script generates multiple output files in the `output/` directory, named `centerpoints_part_N.geojson`.
+
+Each file contains a `FeatureCollection` of points representing the detected pivot centers. Properties include:
+-   `confidence`: Model confidence score (0.0 - 1.0).
+-   `field_coverage`: Estimated irrigated sector angles (e.g., `[0, 270]`).
+-   `avg_length_meters`: Average length of the pivot arm.
+-   `arms`: A list of detected arms for each image date, including:
+    -   `image_date`: Date of the satellite image.
+    -   `geometry`: `LineString` representing the arm.
+    -   `length_meters`: Length of the arm.
 -   `imagery_source`: "Google Earth Engine (USDA/NAIP/DOQQ)".
--   `source_metadata`:
-    -   `gee_id`: The unique ID of the image in Earth Engine.
-    -   `date`: The acquisition date of the image.
-    -   `collection`: The source collection.

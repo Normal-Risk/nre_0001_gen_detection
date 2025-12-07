@@ -4,3 +4,5 @@ python-dotenv
 requests
 earthengine-api
 google-auth
+shapely
+pyproj

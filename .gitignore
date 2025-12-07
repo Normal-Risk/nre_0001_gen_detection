@@ -216,3 +216,4 @@ output/*
 *.geojson
 *.jsonl
 batch_input.jsonl
+filter.py
